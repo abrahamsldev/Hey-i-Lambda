@@ -1,0 +1,5 @@
+langchain
+langchain-openai
+langchain-mcp-adapters
+PyJWT[crypto]
+requests
