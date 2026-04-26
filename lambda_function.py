@@ -8,6 +8,7 @@ import json
 import asyncio
 from typing import Any, Dict
 
+import anthropic as anthropic_sdk
 import jwt
 from jwt import PyJWKClient
 
@@ -189,43 +190,60 @@ Comportamiento esperado:
     return result["messages"][-1].content
 
 
-# ─── Prompts por tipo de trigger ─────────────────────────────────────────────
+# ─── Prompts para generación de insight_text por tipo de trigger ────────────
+# Solo se usa el contexto del usuario + el trigger para generar el párrafo.
 
-TRIGGER_PROMPTS: dict[str, str] = {
+INSIGHT_SYSTEM_PROMPT = """Eres el motor de recomendaciones de Hey Banco.
+Escribe exactamente 2-3 oraciones en español mexicano, tono directo y cercano.
+
+Reglas:
+- Usa los números concretos del usuario: montos, porcentajes, días, productos activos.
+- Sin saludos ni cierres. Solo el texto de recomendación.
+- Máximo 55 palabras.
+- La última oración es un CTA directo y específico."""
+
+TRIGGER_USER_PROMPTS: dict[str, str] = {
     "cargo_fallido_reciente": (
-        "Contexto del trigger: el usuario tuvo un cargo fallido en las últimas 24 horas. "
-        "Datos del cargo: {data}. "
-        "Usa este contexto para elegir el insight_type más adecuado al persistir el resultado."
+        "Trigger: cargo fallido reciente.\n"
+        "Datos: {profile}\n"
+        "Escribe el texto: menciona el impacto en su cuenta, sugiere una acción concreta (revisar saldo o actualizar tarjeta), "
+        "cierra invitando a resolver desde la app."
     ),
     "credito_al_limite": (
-        "Contexto del trigger: el crédito del usuario está cerca del límite (z-score de utilización > 1.5). "
-        "Datos: {data}. "
-        "Usa este contexto para personalizar el mensaje al persistir el insight."
+        "Trigger: crédito cerca del límite.\n"
+        "Datos: {profile}\n"
+        "Escribe el texto: menciona el porcentaje exacto de utilización, sugiere un monto de pago realista con base en su ingreso mensual, "
+        "cierra con CTA para ver plan de pago."
     ),
     "sin_login_reciente": (
-        "Contexto del trigger: el usuario lleva más de 15 días sin abrir la app. "
-        "Datos: {data}. "
-        "Usa este contexto para orientar el insight hacia la reactivación."
+        "Trigger: usuario sin actividad en la app.\n"
+        "Datos: {profile}\n"
+        "Escribe el texto: menciona los días exactos sin actividad, nombra un beneficio concreto que tiene sin aprovechar, "
+        "cierra invitándolo a entrar hoy."
     ),
     "nomina_sin_inversion": (
-        "Contexto del trigger: el usuario tiene nómina domiciliada pero no tiene inversiones activas. "
-        "Datos: {data}. "
-        "Usa este contexto para orientar el insight hacia la inversión o beneficios de nómina."
+        "Trigger: tiene nómina pero no invierte.\n"
+        "Datos: {profile}\n"
+        "Escribe el texto: menciona su ingreso mensual y sugiere un porcentaje o monto a invertir, "
+        "cierra con CTA para activar Hey Inversión."
     ),
     "suscripcion_sin_uso": (
-        "Contexto del trigger: el usuario tiene cargos recurrentes pero no usa la app activamente. "
-        "Datos: {data}. "
-        "Usa este contexto para orientar el insight hacia el valor del cashback o la reactivación."
+        "Trigger: suscripciones activas, app sin uso.\n"
+        "Datos: {profile}\n"
+        "Escribe el texto: menciona el gasto anual o mensual en digital, indica el cashback que podría recuperar, "
+        "cierra invitando a activar el beneficio."
     ),
     "gasto_inusual": (
-        "Contexto del trigger: el usuario tuvo un gasto inusual comparado con su historial. "
-        "Datos: {data}. "
-        "Usa este contexto para contextualizar el gasto dentro de su patrón habitual."
+        "Trigger: gasto inusual detectado.\n"
+        "Datos: {profile}\n"
+        "Escribe el texto: alerta de forma tranquila sobre el movimiento, ofrece reportarlo, "
+        "cierra sugiriendo activar alertas de gasto."
     ),
     "baja_satisfaccion": (
-        "Contexto del trigger: el usuario reportó satisfacción menor a 6/10. "
-        "Datos: {data}. "
-        "Usa este contexto para orientar el insight hacia la retención y el apoyo concreto."
+        "Trigger: satisfacción menor a 6/10.\n"
+        "Datos: {profile}\n"
+        "Escribe el texto: reconoce sin ser defensivo, ofrece un canal concreto (chat en la app), "
+        "cierra con mensaje de compromiso de Hey."
     ),
 }
 
@@ -274,6 +292,59 @@ TRIGGER_INSIGHT_TEXTS: dict[str, str] = {
 }
 
 
+async def _generate_insight_text(
+    trigger_type: str,
+    profile: dict,
+) -> str:
+    """
+    Llama a Claude directamente (sin agente) para generar un párrafo
+    personalizado. Timeout de 20s. Si falla, devuelve el texto fallback.
+    """
+    client = anthropic_sdk.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+
+    prompt_template = TRIGGER_USER_PROMPTS.get(trigger_type)
+    if not prompt_template:
+        return TRIGGER_INSIGHT_TEXTS.get(
+            trigger_type,
+            "Tienes una recomendación personalizada disponible en tu app.",
+        )
+
+    # Construir resumen legible del perfil con las métricas clave
+    profile_summary = (
+        f"Segmento: {profile.get('segment_name', 'Sin segmento')}. "
+        f"Ingreso mensual: ${profile.get('ingreso_mensual_mxn', 0):,.0f} MXN. "
+        f"Gasto anual: ${profile.get('gasto_total_anual_mxn', 0):,.0f} MXN. "
+        f"Utilización de crédito: {profile.get('utilizacion_credito_pct', 0):.1f}%. "
+        f"Tasa de fallos: {profile.get('tasa_fallos_pct', 0):.1f}%. "
+        f"Días sin abrir la app: {profile.get('dias_desde_ultimo_login', 0)}. "
+        f"Productos activos: {profile.get('num_productos_activos', 0)}. "
+        f"Nómina domiciliada: {'Sí' if profile.get('nomina_domiciliada') else 'No'}. "
+        f"Hey Pro: {'Sí' if profile.get('es_hey_pro') else 'No'}. "
+        f"Ocupación: {profile.get('ocupacion', 'No disponible')}."
+    )
+
+    user_prompt = prompt_template.format(profile=profile_summary)
+
+    try:
+        msg = await asyncio.wait_for(
+            client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=180,
+                system=INSIGHT_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}],
+            ),
+            timeout=20.0,
+        )
+        generated = msg.content[0].text.strip()
+        return generated if generated else TRIGGER_INSIGHT_TEXTS.get(trigger_type, "")
+    except Exception as gen_err:
+        print(f"[generate_insight_text] Claude call failed: {gen_err}")
+        return TRIGGER_INSIGHT_TEXTS.get(
+            trigger_type,
+            "Tienes una recomendación personalizada disponible en tu app.",
+        )
+
+
 async def run_insights_direct(
     user_id: str,
     trigger_type: str,
@@ -298,12 +369,14 @@ async def run_insights_direct(
     except Exception as seg_err:
         print(f"[insights_direct] segment lookup failed: {seg_err}")
 
-    # 2. Texto e insight_type desde plantilla
-    insight_text = TRIGGER_INSIGHT_TEXTS.get(
-        trigger_type,
-        "Tienes una recomendación personalizada disponible en tu app.",
-    )
+    # 2. Generar insight_text personalizado con Claude (solo el párrafo)
     insight_type = TRIGGER_TO_INSIGHT_TYPE.get(trigger_type)
+
+    # Construir perfil mínimo con los datos disponibles
+    profile: dict = {"segment_name": segment_name or "Sin segmento"}
+    profile.update(trigger_data)  # incluye datos del trigger (ingreso, días, etc.)
+
+    insight_text = await _generate_insight_text(trigger_type, profile)
 
     # 3. Persistir via MCP (sin LLM)
     save_result = await call_mcp_tool("save_user_insight", {
