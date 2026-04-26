@@ -229,74 +229,95 @@ TRIGGER_PROMPTS: dict[str, str] = {
     ),
 }
 
+# ─── Pipeline directo: tipo de trigger → insight_type y texto ────────────────
 
-async def run_insights_agent(
+TRIGGER_TO_INSIGHT_TYPE: dict[str, str] = {
+    "cargo_fallido_reciente":   "retention_churn_risk",
+    "credito_al_limite":        "financial_stress_relief",
+    "sin_login_reciente":       "retention_reactivation",
+    "nomina_sin_inversion":     "upsell_investment",
+    "suscripcion_sin_uso":      "upsell_digital",
+    "gasto_inusual":            "financial_stress_relief",
+    "baja_satisfaccion":        "retention_churn_risk",
+}
+
+TRIGGER_INSIGHT_TEXTS: dict[str, str] = {
+    "cargo_fallido_reciente": (
+        "Detectamos que uno de tus pagos no pudo procesarse recientemente. "
+        "Asegúrate de que tu cuenta tenga saldo suficiente o que tu tarjeta esté activa. "
+        "Si necesitas ayuda, escríbenos en el chat y lo resolvemos juntos."
+    ),
+    "credito_al_limite": (
+        "Tu crédito está cerca del límite. Reducir tu saldo puede mejorar tu salud financiera "
+        "y abrirte nuevas oportunidades. Podemos ayudarte a crear un plan de pago."
+    ),
+    "sin_login_reciente": (
+        "¡Te extrañamos! Tienes beneficios activos que no has aprovechado. "
+        "Entra a la app para ver tus cashbacks, inversiones disponibles y más."
+    ),
+    "nomina_sin_inversion": (
+        "Recibes tu nómina en Hey pero aún no tienes una inversión activa. "
+        "Con Hey Inversión puedes poner a trabajar tu dinero desde el primer peso. ¿Empezamos?"
+    ),
+    "suscripcion_sin_uso": (
+        "Tienes suscripciones activas que califican para cashback. "
+        "Activa tus beneficios digitales y recupera hasta el 2% en cada cargo automático."
+    ),
+    "gasto_inusual": (
+        "Detectamos un movimiento diferente a tu patrón habitual. "
+        "Si no reconoces este cargo, puedes reportarlo desde la app en segundos."
+    ),
+    "baja_satisfaccion": (
+        "Queremos que tengas la mejor experiencia. Si algo no funcionó como esperabas, "
+        "cuéntanos en el chat y lo resolvemos juntos. Tu opinión mejora Hey para todos."
+    ),
+}
+
+
+async def run_insights_direct(
     user_id: str,
     trigger_type: str,
     trigger_data: dict,
-):
+) -> dict:
     """
-    Agente especializado para generar y persistir insights desde triggers de Supabase.
+    Pipeline directo sin LLM: classify_user_segment → plantilla → save_user_insight.
+    Evita timeouts y rate limits de Anthropic.
     """
-    tools = await _get_tools()
+    # 1. Obtener segmento existente (sin forzar reclasificación)
+    segment_name: str | None = None
+    try:
+        seg = await call_mcp_tool("classify_user_segment", {
+            "user_id": user_id,
+            "force_reclassify": False,
+        })
+        if seg.get("ok"):
+            segment_name = (
+                (seg.get("existing_segment") or {}).get("segmento")
+                or seg.get("segmento")
+            )
+    except Exception as seg_err:
+        print(f"[insights_direct] segment lookup failed: {seg_err}")
 
-    model = ChatAnthropic(
-        model="claude-haiku-4-5-20251001",
-        anthropic_api_key=ANTHROPIC_API_KEY,
-        temperature=0,
-    )
-
-    trigger_context = TRIGGER_PROMPTS.get(
+    # 2. Texto e insight_type desde plantilla
+    insight_text = TRIGGER_INSIGHT_TEXTS.get(
         trigger_type,
-        "Genera un insight financiero personalizado. Datos: {data}",
-    ).format(data=json.dumps(trigger_data, ensure_ascii=False))
-
-    system_prompt = f"""Eres un motor interno de generación de insights financieros para Hey Banco.
-
-Datos del contexto:
-- user_id: "{user_id}"
-- trigger_type: "{trigger_type}"
-
-Contexto del trigger que disparó este proceso:
-{trigger_context}
-
-Tu única tarea en esta ejecución es:
-1. Obtener el insight financiero personalizado del usuario usando las tools disponibles.
-2. Persistir el insight generado con los datos devueltos por el modelo.
-3. Responder SOLO con JSON: {{"saved": true, "insight_id": "<id>"}}
-
-Reglas:
-- Usa las tools disponibles para obtener el insight real del ML.
-- Si el endpoint devuelve error o datos vacíos, crea un insight coherente basado
-  en el contexto del trigger y guárdalo igualmente usando las tools de persistencia.
-- No inventes valores numéricos; usa solo los que devuelva el modelo.
-- No hagas más acciones de las indicadas."""
-
-    agent = create_agent(
-        model=model,
-        tools=tools,
-        system_prompt=system_prompt,
+        "Tienes una recomendación personalizada disponible en tu app.",
     )
+    insight_type = TRIGGER_TO_INSIGHT_TYPE.get(trigger_type)
 
-    result = await asyncio.wait_for(
-        agent.ainvoke(
-            {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Genera y persiste el insight para user_id={user_id} "
-                            f"con trigger={trigger_type}."
-                        ),
-                    }
-                ]
-            },
-            config={"recursion_limit": 25},
-        ),
-        timeout=50.0,
-    )
-    return result["messages"][-1].content
+    # 3. Persistir via MCP (sin LLM)
+    save_result = await call_mcp_tool("save_user_insight", {
+        "user_id": user_id,
+        "trigger_type": trigger_type,
+        "insight_text": insight_text,
+        "segment_name": segment_name,
+        "insight_type": insight_type,
+    })
+    return save_result
 
+
+# run_insights_agent fue reemplazado por run_insights_direct (pipeline sin LLM)
+# para evitar timeouts y rate limits de Anthropic. Ver run_insights_direct más abajo.
 
 async def call_mcp_tool(tool_name: str, tool_input: dict):
     """Invoca una tool del servidor MCP directamente, sin pasar por el agente LLM."""
@@ -386,7 +407,7 @@ def handle_insights_generate(event: Dict[str, Any]) -> Dict[str, Any]:
             return response(400, {"error": "Missing user_id or trigger_type"})
 
         result = asyncio.run(
-            run_insights_agent(
+            run_insights_direct(
                 user_id=user_id,
                 trigger_type=trigger_type,
                 trigger_data=trigger_data,
