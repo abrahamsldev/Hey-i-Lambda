@@ -298,6 +298,72 @@ Reglas:
     return result["messages"][-1].content
 
 
+async def call_mcp_tool(tool_name: str, tool_input: dict):
+    """Invoca una tool del servidor MCP directamente, sin pasar por el agente LLM."""
+    tools = await _get_tools()
+    tool = next((t for t in tools if t.name == tool_name), None)
+    if tool is None:
+        raise ValueError(f"MCP tool '{tool_name}' no encontrada")
+    result = await tool.ainvoke(tool_input)
+    # langchain_mcp_adapters puede devolver el resultado como JSON string
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return result
+
+
+def handle_spending_dashboard(event: Dict[str, Any]) -> Dict[str, Any]:
+    """GET /get_spending_dashboard — requiere JWT de usuario."""
+    try:
+        token = extract_bearer_token(event)
+        payload = verify_supabase_jwt(token)
+        user_id = payload.get("sub")
+        if not user_id:
+            return response(401, {"error": "Token inválido: falta sub"})
+
+        result = asyncio.run(
+            call_mcp_tool("get_spending_dashboard", {"user_id": user_id})
+        )
+        return response(200, {"structuredContent": result})
+    except ValueError as e:
+        return response(400, {"error": str(e)})
+    except jwt.ExpiredSignatureError:
+        return response(401, {"error": "Token expirado"})
+    except jwt.InvalidTokenError as e:
+        return response(401, {"error": f"Token inválido: {str(e)}"})
+    except Exception as e:
+        print("handle_spending_dashboard error:", repr(e))
+        print(traceback.format_exc())
+        return response(500, {"error": "Internal server error"})
+
+
+def handle_savings_dashboard(event: Dict[str, Any]) -> Dict[str, Any]:
+    """GET /get_savings_dashboard — requiere JWT de usuario."""
+    try:
+        token = extract_bearer_token(event)
+        payload = verify_supabase_jwt(token)
+        user_id = payload.get("sub")
+        if not user_id:
+            return response(401, {"error": "Token inválido: falta sub"})
+
+        result = asyncio.run(
+            call_mcp_tool("get_savings_dashboard", {"user_id": user_id})
+        )
+        return response(200, {"structuredContent": result})
+    except ValueError as e:
+        return response(400, {"error": str(e)})
+    except jwt.ExpiredSignatureError:
+        return response(401, {"error": "Token expirado"})
+    except jwt.InvalidTokenError as e:
+        return response(401, {"error": f"Token inválido: {str(e)}"})
+    except Exception as e:
+        print("handle_savings_dashboard error:", repr(e))
+        print(traceback.format_exc())
+        return response(500, {"error": "Internal server error"})
+
+
 def handle_insights_generate(event: Dict[str, Any]) -> Dict[str, Any]:
     """Endpoint interno llamado por la Edge Function de Supabase."""
     headers = event.get("headers") or {}
@@ -354,6 +420,13 @@ def lambda_handler(event, context):
         # ── Endpoint interno: no requiere JWT de usuario ──
         if raw_path.rstrip("/") == "/insights/generate":
             return handle_insights_generate(event)
+
+        # ── Dashboards: requieren JWT ──────────────────────
+        if raw_path.rstrip("/") == "/get_spending_dashboard":
+            return handle_spending_dashboard(event)
+
+        if raw_path.rstrip("/") == "/get_savings_dashboard":
+            return handle_savings_dashboard(event)
 
         # ── Endpoint de chat: requiere JWT de usuario ─────
         token = extract_bearer_token(event)
