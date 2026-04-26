@@ -1,5 +1,6 @@
 langchain
 langchain-openai
+langchain-anthropic
 langchain-mcp-adapters
 PyJWT[crypto]
 requests
