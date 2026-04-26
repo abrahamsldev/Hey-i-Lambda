@@ -28,6 +28,31 @@ MCP_INTERNAL_SECRET = os.environ.get("MCP_INTERNAL_SECRET")
 # Secreto compartido entre la Edge Function de Supabase y este Lambda
 INSIGHTS_INTERNAL_SECRET = os.environ.get("INSIGHTS_INTERNAL_SECRET")
 
+# ─── MCP config y caché de tools (se reutiliza en warm starts) ───────────────
+
+def _build_mcp_config() -> dict:
+    cfg: dict = {
+        "app_tools": {
+            "url": MCP_SERVER_URL,
+            "transport": "streamable_http",
+        }
+    }
+    if MCP_INTERNAL_SECRET:
+        cfg["app_tools"]["headers"] = {
+            "Authorization": f"Bearer {MCP_INTERNAL_SECRET}"
+        }
+    return cfg
+
+_cached_tools: list | None = None
+
+async def _get_tools() -> list:
+    """Obtiene las tools del servidor MCP y las cachea en memoria."""
+    global _cached_tools
+    if _cached_tools is None:
+        mcp_client = MultiServerMCPClient(_build_mcp_config())
+        _cached_tools = await mcp_client.get_tools()
+    return _cached_tools
+
 
 def response(status_code: int, body: Dict[str, Any]):
     return {
@@ -107,24 +132,7 @@ async def run_agent(
     Carga las tools desde FastMCP y soporta historial de conversación.
     """
 
-    mcp_config = {
-        "app_tools": {
-            "url": MCP_SERVER_URL,
-            "transport": "streamable_http",
-        }
-    }
-
-    # Si tu FastMCP está protegido con un token interno,
-    # intenta pasar headers al cliente MCP.
-    # Dependiendo de tu versión de langchain-mcp-adapters,
-    # los headers pueden ir dentro de la config del servidor.
-    if MCP_INTERNAL_SECRET:
-        mcp_config["app_tools"]["headers"] = {
-            "Authorization": f"Bearer {MCP_INTERNAL_SECRET}"
-        }
-
-    mcp_client = MultiServerMCPClient(mcp_config)
-    tools = await mcp_client.get_tools()
+    tools = await _get_tools()
 
     model = ChatAnthropic(
         model="claude-haiku-4-5-20251001",
@@ -145,19 +153,8 @@ Reglas de seguridad obligatorias:
 - No reveles tokens, secretos, API keys ni datos internos.
 - Solo consulta datos del propio user_id del usuario autenticado.
 
-Tablas disponibles en Supabase (usa run_query o supabase_select_rows):
-- user_profiles: perfil del usuario (edad, ciudad, ocupacion, ingreso_mensual_mxn, score_buro, es_hey_pro, num_productos_activos, etc.)
-- chat_messages: historial de conversación del usuario (role, content, created_at)
-
-Herramienta de modelo de ML (usa call_model_endpoint):
-- segmentacion/health → GET: verifica que el servicio esté activo
-- segmentacion/segments → GET: lista todos los segmentos/clusters disponibles
-- segmentacion/insight/existing → POST con {{user_id, language}}: obtiene el insight financiero personalizado del usuario
-- segmentacion/insight/new → POST con features del usuario: genera un insight para un usuario nuevo
-
 Comportamiento esperado:
-- Para preguntas financieras del usuario, consulta su perfil y usa call_model_endpoint para obtener insights.
-- Usa las tablas de Supabase solo cuando necesites datos específicos del usuario.
+- Usa las tools disponibles para responder preguntas financieras del usuario.
 - Responde siempre en el idioma del usuario (español por defecto).
 - Sé conciso, claro y orientado a acciones concretas."""
 
@@ -174,15 +171,19 @@ Comportamiento esperado:
         if m.get("role") in ("user", "assistant") and m.get("content")
     ]
 
-    result = await agent.ainvoke(
-        {
-            "messages": prior_messages + [
-                {
-                    "role": "user",
-                    "content": message,
-                }
-            ]
-        }
+    result = await asyncio.wait_for(
+        agent.ainvoke(
+            {
+                "messages": prior_messages + [
+                    {
+                        "role": "user",
+                        "content": message,
+                    }
+                ]
+            },
+            config={"recursion_limit": 25},
+        ),
+        timeout=50.0,
     )
 
     return result["messages"][-1].content
@@ -192,40 +193,39 @@ Comportamiento esperado:
 
 TRIGGER_PROMPTS: dict[str, str] = {
     "cargo_fallido_reciente": (
-        "El usuario tuvo un cargo fallido en las últimas 24 horas. "
+        "Contexto del trigger: el usuario tuvo un cargo fallido en las últimas 24 horas. "
         "Datos del cargo: {data}. "
-        "Genera un insight de tipo 'financial_stress_relief' con una recomendación concreta "
-        "para evitar futuros fallos y estabilizar sus finanzas."
+        "Usa este contexto para elegir el insight_type más adecuado al persistir el resultado."
     ),
     "credito_al_limite": (
-        "El crédito del usuario está cerca del límite (z-score de utilización > 1.5). "
+        "Contexto del trigger: el crédito del usuario está cerca del límite (z-score de utilización > 1.5). "
         "Datos: {data}. "
-        "Genera un insight de tipo 'financial_stress_relief' que le ayude a reducir su carga."
+        "Usa este contexto para personalizar el mensaje al persistir el insight."
     ),
     "sin_login_reciente": (
-        "El usuario lleva más de 15 días sin abrir la app. "
+        "Contexto del trigger: el usuario lleva más de 15 días sin abrir la app. "
         "Datos: {data}. "
-        "Genera un insight de tipo 'retention_reactivation' con una razón concreta para volver."
+        "Usa este contexto para orientar el insight hacia la reactivación."
     ),
     "nomina_sin_inversion": (
-        "El usuario tiene nómina domiciliada pero no tiene inversiones activas (has_inversion_z < 0). "
+        "Contexto del trigger: el usuario tiene nómina domiciliada pero no tiene inversiones activas. "
         "Datos: {data}. "
-        "Genera un insight de tipo 'loyalty_payroll' motivándolo a invertir desde la app."
+        "Usa este contexto para orientar el insight hacia la inversión o beneficios de nómina."
     ),
     "suscripcion_sin_uso": (
-        "El usuario tiene cargos recurrentes pero no usa la app activamente. "
+        "Contexto del trigger: el usuario tiene cargos recurrentes pero no usa la app activamente. "
         "Datos: {data}. "
-        "Genera un insight de tipo 'upsell_digital' mostrándole el valor del cashback en esas suscripciones."
+        "Usa este contexto para orientar el insight hacia el valor del cashback o la reactivación."
     ),
     "gasto_inusual": (
-        "El usuario tuvo un gasto inusual comparado con su historial. "
+        "Contexto del trigger: el usuario tuvo un gasto inusual comparado con su historial. "
         "Datos: {data}. "
-        "Genera un insight personalizado sobre ese patrón de gasto."
+        "Usa este contexto para contextualizar el gasto dentro de su patrón habitual."
     ),
     "baja_satisfaccion": (
-        "El usuario reportó satisfacción menor a 6/10. "
+        "Contexto del trigger: el usuario reportó satisfacción menor a 6/10. "
         "Datos: {data}. "
-        "Genera un insight de tipo 'retention_churn_risk' ofreciendo apoyo concreto."
+        "Usa este contexto para orientar el insight hacia la retención y el apoyo concreto."
     ),
 }
 
@@ -238,19 +238,7 @@ async def run_insights_agent(
     """
     Agente especializado para generar y persistir insights desde triggers de Supabase.
     """
-    mcp_config = {
-        "app_tools": {
-            "url": MCP_SERVER_URL,
-            "transport": "streamable_http",
-        }
-    }
-    if MCP_INTERNAL_SECRET:
-        mcp_config["app_tools"]["headers"] = {
-            "Authorization": f"Bearer {MCP_INTERNAL_SECRET}"
-        }
-
-    mcp_client = MultiServerMCPClient(mcp_config)
-    tools = await mcp_client.get_tools()
+    tools = await _get_tools()
 
     model = ChatAnthropic(
         model="claude-haiku-4-5-20251001",
@@ -265,29 +253,22 @@ async def run_insights_agent(
 
     system_prompt = f"""Eres un motor interno de generación de insights financieros para Hey Banco.
 
-Tu única tarea en esta ejecución es:
-1. Llamar a call_model_endpoint con:
-   - model: "segmentacion"
-   - function: "insight/existing"
-   - method: "POST"
-   - payload: {{"user_id": "{user_id}", "language": "es"}}
-
-2. Con la respuesta del modelo, llamar a save_user_insight con los siguientes campos:
-   - user_id: "{user_id}"
-   - trigger_type: "{trigger_type}"
-   - insight_text: el texto del insight devuelto por el modelo
-   - segment_name, insight_type, cluster, score_buro, utilizacion_credito_pct,
-     gasto_total_anual_mxn, tasa_fallos_pct: los valores que devuelva el modelo
-
-3. Responder SOLO con JSON: {{"saved": true, "insight_id": "<id>"}}
+Datos del contexto:
+- user_id: "{user_id}"
+- trigger_type: "{trigger_type}"
 
 Contexto del trigger que disparó este proceso:
 {trigger_context}
 
+Tu única tarea en esta ejecución es:
+1. Obtener el insight financiero personalizado del usuario usando las tools disponibles.
+2. Persistir el insight generado con los datos devueltos por el modelo.
+3. Responder SOLO con JSON: {{"saved": true, "insight_id": "<id>"}}
+
 Reglas:
-- SIEMPRE llama primero a call_model_endpoint para obtener el insight real del ML.
+- Usa las tools disponibles para obtener el insight real del ML.
 - Si el endpoint devuelve error o datos vacíos, crea un insight coherente basado
-  en el contexto del trigger y guárdalo igualmente con save_user_insight.
+  en el contexto del trigger y guárdalo igualmente usando las tools de persistencia.
 - No inventes valores numéricos; usa solo los que devuelva el modelo.
 - No hagas más acciones de las indicadas."""
 
@@ -297,18 +278,22 @@ Reglas:
         system_prompt=system_prompt,
     )
 
-    result = await agent.ainvoke(
-        {
-            "messages": [
-                {
-                    "role": "user",
-                    "content": (
-                        f"Genera y persiste el insight para user_id={user_id} "
-                        f"con trigger={trigger_type}."
-                    ),
-                }
-            ]
-        }
+    result = await asyncio.wait_for(
+        agent.ainvoke(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Genera y persiste el insight para user_id={user_id} "
+                            f"con trigger={trigger_type}."
+                        ),
+                    }
+                ]
+            },
+            config={"recursion_limit": 25},
+        ),
+        timeout=50.0,
     )
     return result["messages"][-1].content
 
